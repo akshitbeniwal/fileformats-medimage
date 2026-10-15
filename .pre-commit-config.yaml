@@ -33,7 +33,7 @@ repos:
         args: [--strict, --install-types, --non-interactive]
         exclude: tests
         additional_dependencies:
-          - fileformats>=0.19
+          - fileformats>=0.20
           - pytest
           - pydicom
           - nibabel
