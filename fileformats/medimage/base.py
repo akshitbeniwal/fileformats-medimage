@@ -1,12 +1,16 @@
 import logging
 import os
-import shutil
 import sys
-import tempfile
 import typing as ty
 from pathlib import Path
 
-from fileformats.core import FileSet, Loaded, extra, mtime_cached_property
+from fileformats.core import (
+    FileSet,
+    Loaded,
+    extra,
+    mtime_cached_property,
+    staged_out_dir,
+)
 from fileformats.core.mixin import WithClassifiers
 
 from .contents import ContentsClassifier
@@ -38,49 +42,6 @@ DataArrayType: TypeAlias = (
 )  # In Py<3.9 this is problematic "numpy.typing.NDArray[typing.Union[numpy.floating[typing.Any], numpy.integer[typing.Any]]]"
 
 
-def _deidentify_wrapper(
-    implementation: ty.Callable[..., ty.Any],
-    fileset: FileSet,
-    out_dir: os.PathLike[str],
-    *args: ty.Any,
-    **kwargs: ty.Any,
-) -> FileSet:
-    """Runs the deidentify implementation with a hidden staging directory alongside
-    `out_dir` as its output directory, and only moves its output into `out_dir` once it
-    has returned, so that only fully deidentified files end up there. Implementations
-    are therefore free to copy files into their output directory and deidentify them
-    in place."""
-    out_dir = Path(out_dir).absolute()
-    out_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging_dir = Path(
-        tempfile.mkdtemp(dir=out_dir.parent, prefix=f".deidentify-{out_dir.name}-")
-    )
-    try:
-        deidentified: FileSet = implementation(fileset, staging_dir, *args, **kwargs)
-        try:
-            rel_fspaths = [
-                p.absolute().relative_to(staging_dir) for p in deidentified.fspaths
-            ]
-        except ValueError:
-            raise RuntimeError(
-                f"The deidentify implementation for {type(fileset)} filesets, "
-                f"{implementation}, didn't write its output to the 'out_dir' it was "
-                f"passed: {deidentified.fspaths}"
-            ) from None
-        entries = sorted(staging_dir.iterdir())
-        if existing := [e.name for e in entries if (out_dir / e.name).exists()]:
-            raise FileExistsError(
-                f"Cannot deidentify {fileset} into {out_dir} as {existing} already "
-                "exist(s) there"
-            )
-        out_dir.mkdir(exist_ok=True)
-        for entry in entries:
-            os.replace(entry, out_dir / entry.name)
-    finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-    return type(deidentified)([out_dir / p for p in rel_fspaths])
-
-
 class MedicalImagingData(FileSet):
     """Base class for all medical imaging data including pre-image raw data and
     associated data"""
@@ -91,7 +52,7 @@ class MedicalImagingData(FileSet):
     # them (see `deidentify_nested`). Being truthy, it is still treated as holding PHI
     contains_phi: bool | ty.Literal["nested"] = True
 
-    @extra(wrapper=_deidentify_wrapper)
+    @extra(wrapper=staged_out_dir)
     def deidentify(
         self,
         out_dir: os.PathLike[str],
@@ -157,7 +118,13 @@ class MedicalImagingData(FileSet):
     ) -> Self:
         """Deidentifies the medical imaging data nested within the fileset (i.e.
         returned by its validated properties) with their own implementations, and
-        copies its remaining files unchanged, keeping the same layout.
+        copies its remaining files unchanged, keeping the same layout (see
+        `FileSet.map_nested`).
+
+        Nested filesets of other types are deidentified too if they have a truthy
+        `contains_phi` attribute, which they then need a `deidentify` method for
+        (taking the same arguments), so formats from other packages that follow the
+        same convention can be nested within each other.
 
         For use within `deidentify` implementations of formats that contain others,
         which can then deidentify any of the format's own files that may contain PHI
@@ -179,65 +146,20 @@ class MedicalImagingData(FileSet):
         Self
             the copy of the fileset with the nested filesets deidentified
         """
-        out_dir = Path(out_dir)
-        src_root = _root_dir(self)
-        own_paths = set(self.all_file_paths())
-        # Deidentify the nested formats first, each writing straight into its place in
-        # the copy's layout. Formats without an implementation raise here, before
-        # anything is copied
-        deidentified_paths: set[Path] = set()
-        for nested in _direct_nested_filesets(self):
-            if not (isinstance(nested, MedicalImagingData) and nested.contains_phi):
-                continue  # copied unchanged along with the rest
-            nested_paths = set(nested.all_file_paths())
-            if outside := sorted(nested_paths - own_paths):
-                raise ValueError(
-                    f"{nested} is nested within {self} but contains paths that aren't "
-                    f"part of it, {outside}, so the properties of {type(self)} should "
-                    "only return filesets made up of its own paths"
+
+        def deidentify(nested: FileSet, dest_dir: Path) -> FileSet | None:
+            # Duck-typed, so nested formats from other families that follow the same
+            # `contains_phi`/`deidentify` convention (e.g. medical imaging data and
+            # biosignals) are also deidentified. One that may contain PHI but doesn't
+            # have a `deidentify` method raises, rather than being copied
+            if getattr(nested, "contains_phi", False):
+                deidentified: FileSet = nested.deidentify(  # type: ignore[attr-defined]
+                    dest_dir, recipe=recipe, **kwargs
                 )
-            if nested_paths <= deidentified_paths:
-                continue  # already deidentified as part of another nested fileset
-            nested.deidentify(
-                out_dir / _root_dir(nested).relative_to(src_root),
-                recipe=recipe,
-                **kwargs,
-            )
-            deidentified_paths.update(nested_paths)
-        for path in own_paths - deidentified_paths:
-            dest = out_dir / path.relative_to(src_root)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, dest)
-        # Reinstantiating the type checks that the nested deidentifications preserved
-        # the layout it requires (e.g. didn't rename files it looks for)
-        return type(self)([out_dir / p.relative_to(src_root) for p in self.fspaths])
+                return deidentified
+            return None  # copied unchanged
 
-
-def _root_dir(fileset: FileSet) -> Path:
-    """The directory containing all of the fileset's paths (the parent of a directory
-    fileset rather than the directory itself)"""
-    return Path(os.path.commonpath([p.parent for p in fileset.fspaths]))
-
-
-def _direct_nested_filesets(fileset: FileSet) -> list[FileSet]:
-    """The filesets returned by the fileset's validated properties, including those
-    within dicts and sequences, but not those nested further down (unlike
-    `FileSet.nested_filesets()`), which are left to the filesets they are nested in"""
-    nested: list[FileSet] = []
-
-    def collect(value: ty.Any) -> None:
-        if isinstance(value, FileSet):
-            nested.append(value)
-        elif isinstance(value, ty.Mapping):
-            for v in value.values():
-                collect(v)
-        elif isinstance(value, (list, tuple, set, frozenset)):
-            for v in value:
-                collect(v)
-
-    for name in sorted(fileset.validated_properties()):
-        collect(getattr(fileset, name))
-    return nested
+        return self.map_nested(out_dir, deidentify)
 
 
 class MedicalImage(WithClassifiers, MedicalImagingData):

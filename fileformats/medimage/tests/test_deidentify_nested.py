@@ -3,7 +3,12 @@ import typing as ty
 from pathlib import Path
 
 import pytest
-from fileformats.core import extra_implementation, validated_property
+from fileformats.core import (
+    extra,
+    extra_implementation,
+    staged_out_dir,
+    validated_property,
+)
 from fileformats.core.exceptions import FormatMismatchError
 from fileformats.generic import Directory, File
 
@@ -100,8 +105,9 @@ def test_deidentify_nested(tmp_path: Path) -> None:
 
     assert isinstance(deidentified, Branch)
     assert deidentified.fspath == out_dir / "branch"
+    # Keys use "/" separators on all platforms (incl. Windows)
     assert {
-        str(p.relative_to(out_dir)): p.read_text()
+        p.relative_to(out_dir).as_posix(): p.read_text()
         for p in deidentified.all_file_paths()
     } == {
         "branch/.hidden": "hidden",
@@ -161,3 +167,66 @@ def test_deidentify_nested_wont_overwrite(tmp_path: Path) -> None:
 
 def test_contains_phi_nested_is_truthy() -> None:
     assert Branch.contains_phi
+
+
+class OtherFamily(File):
+    """A format from another package with its own, separate, `deidentify` hook that
+    follows the same convention"""
+
+    ext = ".other"
+    contains_phi = True
+
+    @extra(wrapper=staged_out_dir)
+    def deidentify(
+        self, out_dir: os.PathLike[str], recipe: None = None, **kwargs: ty.Any
+    ) -> "OtherFamily":
+        raise NotImplementedError
+
+
+@extra_implementation(OtherFamily.deidentify)
+def other_family_deidentify(
+    other: OtherFamily, out_dir: os.PathLike[str], recipe: None = None, **kwargs: ty.Any
+) -> OtherFamily:
+    out_path = Path(out_dir) / other.fspath.name
+    out_path.write_text("deidentified by other family")
+    return OtherFamily(out_path)
+
+
+class ClaimsPhi(File):
+    """A format that may contain PHI but has no `deidentify` method"""
+
+    ext = ".claims"
+    contains_phi = True
+
+
+class Mixed(Directory, MedicalImagingData):
+    contains_phi = "nested"
+
+    @validated_property
+    def others(self) -> list[OtherFamily]:
+        return [OtherFamily(p) for p in sorted(self.fspath.glob("*.other"))]
+
+    @validated_property
+    def claims(self) -> list[ClaimsPhi]:
+        return [ClaimsPhi(p) for p in sorted(self.fspath.glob("*.claims"))]
+
+
+def test_deidentify_nested_other_family(tmp_path: Path) -> None:
+    mixed = tmp_path / "in" / "mixed"
+    mixed.mkdir(parents=True)
+    (mixed / "a.other").write_text("Jane Doe")
+    (mixed / "notes.txt").write_text("notes")
+    deidentified = Mixed(mixed).deidentify(tmp_path / "out")
+    assert (deidentified.fspath / "a.other").read_text() == (
+        "deidentified by other family"
+    )
+    assert (deidentified.fspath / "notes.txt").read_text() == "notes"
+
+
+def test_deidentify_nested_phi_without_deidentify_raises(tmp_path: Path) -> None:
+    mixed = tmp_path / "in" / "mixed"
+    mixed.mkdir(parents=True)
+    (mixed / "a.claims").write_text("Jane Doe")
+    with pytest.raises(AttributeError, match="deidentify"):
+        Mixed(mixed).deidentify(tmp_path / "out")
+    assert not (tmp_path / "out").exists()
