@@ -31,7 +31,7 @@ def instances(tmp_path):
         dataset.HighBit = 15
         dataset.PixelRepresentation = 0
         dataset.PixelData = b"\0\0"
-        dataset.save_as(path, enforce_file_format=True)
+        dataset.save_as(path, write_like_original=False)
     return tmp_path
 
 
